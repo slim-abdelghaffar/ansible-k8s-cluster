@@ -1,0 +1,12 @@
+---
+- name: Configuration kubectl avec confirmation automatique
+  hosts: master
+  become: yes
+  tasks:
+    - name: Créer le répertoire .kube
+      shell: |
+        mkdir -p $HOME/.kube
+        yes | sudo cp -f /etc/kubernetes/admin.conf $HOME/.kube/config
+        sudo chown $(id -u):$(id -g) $HOME/.kube/config
+      args:
+        executable: /bin/bash

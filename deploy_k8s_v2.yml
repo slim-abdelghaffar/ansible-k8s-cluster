@@ -1,0 +1,506 @@
+---
+- name: Préparer les nœuds du cluster Kubernetes
+  hosts: all
+  become: yes
+  
+  tasks:
+    # Installation des dépendances système
+    - name: Installer les dépendances système
+      apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gnupg
+          - lsb-release
+          - python3-apt
+        state: present
+        update_cache: yes
+      when: ansible_os_family == "Debian"
+      ignore_errors: yes
+
+    # Désactivation du swap
+    - name: Désactiver le swap
+      shell: |
+        swapoff -a
+        sed -i '/ swap / s/^\\(.*\\)$/#\\1/g' /etc/fstab
+      ignore_errors: yes
+
+    # Configuration des modules kernel
+    - name: Charger les modules kernel nécessaires
+      modprobe:
+        name: "{{ item }}"
+        state: present
+      loop:
+        - overlay
+        - br_netfilter
+
+    # Configuration des modules à charger au démarrage
+    - name: Configurer les modules à charger au démarrage
+      copy:
+        dest: /etc/modules-load.d/kubernetes.conf
+        content: |
+          overlay
+          br_netfilter
+        mode: '0644'
+
+    # Configuration des paramètres sysctl
+    - name: Configurer les paramètres sysctl
+      copy:
+        dest: /etc/sysctl.d/kubernetes.conf
+        content: |
+          net.bridge.bridge-nf-call-ip6tables = 1
+          net.bridge.bridge-nf-call-iptables = 1
+          net.ipv4.ip_forward = 1
+        mode: '0644'
+
+    # Application des paramètres sysctl
+    - name: Appliquer les paramètres sysctl
+      command: sysctl --system
+      register: sysctl_result
+      changed_when: "'applying' in sysctl_result.stdout"
+
+# Playbook pour la configuration réseau et des noms d'hôte
+- name: Configurer les noms d'hôte et le réseau
+  hosts: all
+  become: yes
+  
+  tasks:
+    # Configuration du nom d'hôte
+    - name: Définir le nom d'hôte permanent
+      hostname:
+        name: "{{ inventory_hostname }}"
+
+    # Mise à jour de /etc/hosts
+    - name: Mettre à jour /etc/hosts
+      blockinfile:
+        path: /etc/hosts
+        marker: "# {mark} ANSIBLE MANAGED BLOCK KUBERNETES"
+        block: |
+          192.168.1.32 master-node
+          192.168.1.14 worker-node
+        create: yes
+
+    # Configuration DNS
+    - name: Configurer le délai d'attente DNS
+      lineinfile:
+        path: /etc/resolv.conf
+        line: "options timeout:10 attempts:5"
+        insertafter: EOF
+        state: present
+      ignore_errors: yes
+
+# Playbook pour l'installation de containerd
+- name: Configurer containerd
+  hosts: all
+  become: yes
+  
+  tasks:
+    # Création du répertoire de configuration
+    - name: Créer le répertoire de configuration containerd
+      file:
+        path: /etc/containerd
+        state: directory
+        mode: '0755'
+
+    # Génération de la configuration par défaut
+    - name: Générer la configuration containerd par défaut
+      shell: containerd config default > /etc/containerd/config.toml
+      args:
+        creates: /etc/containerd/config.toml
+
+    # Configuration du driver cgroup
+    - name: Configurer le driver cgroup de containerd
+      replace:
+        path: /etc/containerd/config.toml
+        regexp: 'SystemdCgroup = false'
+        replace: 'SystemdCgroup = true'
+
+    # Redémarrage de containerd
+    - name: Redémarrer containerd
+      service:
+        name: containerd
+        state: restarted
+        enabled: yes
+
+# Playbook pour le nettoyage Kubernetes existant
+- name: Réinitialiser les configurations Kubernetes existantes
+  hosts: all
+  become: yes
+  
+  tasks:
+    # Exécution de kubeadm reset
+    - name: Exécuter kubeadm reset
+      command: kubeadm reset -f
+      ignore_errors: yes
+
+    # Nettoyage des répertoires Kubernetes
+    - name: Nettoyer les répertoires kubernetes
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/kubernetes/manifests
+        - /var/lib/etcd
+        - /etc/kubernetes/pki
+        - /root/.kube
+        - "{{ ansible_env.HOME }}/.kube"
+      ignore_errors: yes
+
+    # Nettoyage des interfaces réseau CNI
+    - name: Nettoyer les interfaces réseau CNI
+      shell: ip link delete cni0; ip link delete flannel.1
+      ignore_errors: yes
+
+    # Nettoyage des iptables
+    - name: Nettoyer iptables
+      shell: iptables -F && iptables -t nat -F && iptables -t mangle -F && iptables -X
+      ignore_errors: yes
+
+# Playbook pour l'initialisation du master
+- name: Initialiser le nœud master
+  hosts: master
+  become: yes
+  
+  tasks:
+    # Configuration de kubelet
+    - name: Configurer kubelet
+      copy:
+        dest: /etc/default/kubelet
+        content: |
+          KUBELET_EXTRA_ARGS="--cgroup-driver=systemd"
+        mode: '0644'
+
+    # Vérification de containerd
+    - name: Vérifier que containerd est actif
+      service:
+        name: containerd
+        state: started
+        enabled: yes
+
+    # Vérification du port 6443
+    - name: Vérifier que le port 6443 est disponible
+      wait_for:
+        port: 6443
+        state: stopped
+        timeout: 10
+      ignore_errors: yes
+
+    # Configuration de kubeadm
+    - name: Créer le fichier de configuration kubeadm
+      copy:
+        dest: /tmp/kubeadm-config.yaml
+        content: |
+          apiVersion: kubeadm.k8s.io/v1beta3
+          kind: InitConfiguration
+          nodeRegistration:
+            criSocket: unix:///var/run/containerd/containerd.sock
+            name: {{ inventory_hostname }}
+          localAPIEndpoint:
+            advertiseAddress: {{ ansible_default_ipv4.address }}
+          ---
+          apiVersion: kubeadm.k8s.io/v1beta3
+          kind: ClusterConfiguration
+          controlPlaneEndpoint: "master-node:6443"
+          networking:
+            podSubnet: "10.244.0.0/16"
+            serviceSubnet: "10.96.0.0/12"
+          ---
+          apiVersion: kubelet.config.k8s.io/v1beta1
+          kind: KubeletConfiguration
+          cgroupDriver: systemd
+        mode: '0644'
+
+    # Initialisation du cluster
+    - name: Initialiser le cluster Kubernetes
+      shell: >-
+        kubeadm init --config=/tmp/kubeadm-config.yaml 
+                     --upload-certs 
+                     --ignore-preflight-errors=all 
+                     --v=5
+      register: kubeadm_init_output
+      retries: 3
+      delay: 30
+      until: kubeadm_init_output is succeeded
+      environment:
+        PATH: "{{ ansible_env.PATH }}:/usr/local/bin:/usr/bin:/bin"
+      args:
+        creates: /etc/kubernetes/admin.conf
+      timeout: 600
+
+# Playbook pour la configuration de l'accès kubectl sans sudo
+- name: Configurer l'accès kubectl sans sudo
+  hosts: master
+  become: yes
+  
+  vars:
+    normal_user: "{{ ansible_user_id }}"
+    
+  tasks:
+    # Vérification de l'existence du fichier admin.conf
+    - name: Vérifier si admin.conf existe
+      stat:
+        path: /etc/kubernetes/admin.conf
+      register: admin_conf_stat
+      
+    # Obtenir le nom de l'utilisateur courant
+    - name: Obtenir le nom de l'utilisateur courant
+      command: id -u -n
+      register: current_user
+      changed_when: false
+      become: no
+      
+    # Assurer que les certificats ont les bonnes permissions
+    - name: Assurer que les certificats PKI ont les bonnes permissions
+      file:
+        path: "/etc/kubernetes/pki"
+        state: directory
+        mode: "0755"
+        recurse: yes
+      when: admin_conf_stat.stat.exists
+      
+    # S'assurer que les certificats sont lisibles
+    - name: S'assurer que les certificats sont lisibles
+      shell: chmod -R a+r /etc/kubernetes/pki
+      when: admin_conf_stat.stat.exists
+      
+    # Configuration pour l'utilisateur normal
+    - name: Créer le répertoire .kube pour l'utilisateur normal
+      file:
+        path: "/home/{{ normal_user }}/.kube"
+        state: directory
+        owner: "{{ normal_user }}"
+        group: "{{ normal_user }}"
+        mode: "0700"
+      when: admin_conf_stat.stat.exists
+
+    # CORRECTION IMPORTANTE: Copier le fichier admin.conf avec les bonnes permissions
+    - name: Copier le fichier admin.conf pour l'utilisateur normal
+      shell: |
+        cp -f /etc/kubernetes/admin.conf /home/{{ normal_user }}/.kube/config
+        chown {{ normal_user }}:{{ normal_user }} /home/{{ normal_user }}/.kube/config
+        chmod 600 /home/{{ normal_user }}/.kube/config
+      when: admin_conf_stat.stat.exists
+      
+    # Configurer kubectl pour l'utilisateur non-root
+    - name: Configurer l'utilisateur pour utiliser kubectl sans sudo
+      blockinfile:
+        path: "/home/{{ normal_user }}/.bashrc"
+        block: |
+          # Configuration pour Kubernetes
+          export KUBECONFIG=/home/{{ normal_user }}/.kube/config
+        marker: "# {mark} ANSIBLE MANAGED BLOCK KUBERNETES"
+        create: yes
+      when: admin_conf_stat.stat.exists
+      
+    # Ajouter l'utilisateur aux groupes nécessaires
+    - name: Ajouter l'utilisateur aux groupes kubernetes
+      user:
+        name: "{{ normal_user }}"
+        groups: "{{ item }}"
+        append: yes
+      loop:
+        - sudo
+        - adm
+      ignore_errors: yes
+        
+    # S'assurer que le répertoire /etc/kubernetes est accessible
+    - name: S'assurer que /etc/kubernetes est accessible
+      file:
+        path: /etc/kubernetes
+        state: directory
+        mode: "0755"
+      when: admin_conf_stat.stat.exists
+      
+    # S'assurer que le fichier admin.conf est accessible
+    - name: S'assurer que le fichier admin.conf est accessible
+      file:
+        path: /etc/kubernetes/admin.conf
+        mode: "0644"
+      when: admin_conf_stat.stat.exists
+      
+    # Configuration pour root (toujours utile)
+    - name: Créer le répertoire .kube pour root
+      file:
+        path: /root/.kube
+        state: directory
+        mode: "0700"
+      when: admin_conf_stat.stat.exists
+
+    - name: Copier le fichier admin.conf vers le répertoire root
+      copy:
+        src: /etc/kubernetes/admin.conf
+        dest: /root/.kube/config
+        remote_src: yes
+        mode: "0600"
+      when: admin_conf_stat.stat.exists
+
+    # Créer un lien symbolique vers les certificats dans le home de l'utilisateur
+    - name: Créer un lien symbolique vers les certificats dans le home de l'utilisateur
+      file:
+        src: /etc/kubernetes/pki
+        dest: "/home/{{ normal_user }}/.kube/pki"
+        state: link
+        owner: "{{ normal_user }}"
+        group: "{{ normal_user }}"
+      when: admin_conf_stat.stat.exists
+      
+    # Installation de Helm avec la méthode manuelle confirmée comme fonctionnelle
+    - name: Ajouter la clé GPG Helm
+      shell: |
+        curl -fsSL https://baltocdn.com/helm/signing.asc | gpg --dearmor | sudo tee /usr/share/keyrings/helm.gpg > /dev/null
+      args:
+        creates: /usr/share/keyrings/helm.gpg
+
+    - name: Installer apt-transport-https
+      apt:
+        name: apt-transport-https
+        state: present
+
+    - name: Configurer le repository Helm
+      shell: |
+        echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/helm.gpg] https://baltocdn.com/helm/stable/debian/ all main" | sudo tee /etc/apt/sources.list.d/helm-stable-debian.list
+
+    - name: Mettre à jour le cache apt
+      apt:
+        update_cache: yes
+
+    - name: Installer Helm
+      apt:
+        name: helm
+        state: present
+
+    # Vérification de l'accès au cluster
+    - name: Attendre que l'API Kubernetes soit disponible
+      wait_for:
+        host: "{{ ansible_default_ipv4.address }}"
+        port: 6443
+        timeout: 300
+      when: admin_conf_stat.stat.exists
+
+    # IMPORTANTE CORRECTION - Modifier le fichier kubeconfig pour ignorer la vérification TLS
+    - name: Modifier le fichier kubeconfig pour ignorer la vérification TLS
+      lineinfile:
+        path: "/home/{{ normal_user }}/.kube/config"
+        regexp: '    insecure-skip-tls-verify: true'
+        insertafter: '    certificate-authority-data:'
+        line: '    insecure-skip-tls-verify: true'
+      when: admin_conf_stat.stat.exists
+      
+    # Configurer kubectl pour ne pas vérifier les certificats
+    - name: Configurer kubectl pour ignorer la vérification TLS
+      shell: |
+        kubectl config set-cluster kubernetes --insecure-skip-tls-verify=true
+      become: yes
+      become_user: "{{ normal_user }}"
+      environment:
+        KUBECONFIG: "/home/{{ normal_user }}/.kube/config"
+      when: admin_conf_stat.stat.exists
+      ignore_errors: yes
+
+    # Vérifier l'accès au cluster sans sudo
+    - name: Vérifier l'accès au cluster sans sudo
+      shell: kubectl get nodes
+      become: yes
+      become_user: "{{ normal_user }}"
+      environment:
+        KUBECONFIG: "/home/{{ normal_user }}/.kube/config"
+      register: kube_check_normal
+      until: kube_check_normal.rc == 0
+      retries: 5
+      delay: 10
+      when: admin_conf_stat.stat.exists
+      ignore_errors: yes
+
+    # Installation de Flannel
+    - name: Installer le réseau Flannel
+      shell: >-
+        kubectl apply -f https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml
+      become: yes
+      become_user: "{{ normal_user }}"
+      environment:
+        KUBECONFIG: "/home/{{ normal_user }}/.kube/config"
+      register: flannel_result
+      retries: 5
+      delay: 15
+      until: flannel_result.rc == 0
+      when: admin_conf_stat.stat.exists
+      ignore_errors: yes
+
+    # Extraire la commande de jointure
+    - name: Obtenir la commande de jointure
+      shell: kubeadm token create --print-join-command
+      register: join_command
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      when: admin_conf_stat.stat.exists
+    
+    - name: Stocker la commande de jointure
+      set_fact:
+        join_command_line: "{{ join_command.stdout }}"
+      when: join_command is defined and join_command.stdout is defined
+
+# Playbook pour joindre les workers
+- name: Joindre les nœuds workers
+  hosts: workers
+  become: yes
+  
+  tasks:
+    - name: Attendre avant de joindre le cluster
+      pause:
+        seconds: 30
+
+    - name: Joindre le cluster
+      shell: "{{ hostvars['master-node']['join_command_line'] }}"
+      register: join_result
+      retries: 5
+      delay: 15
+      until: join_result.rc == 0
+      ignore_errors: yes
+      when: hostvars['master-node']['join_command_line'] is defined
+
+# Playbook final pour vérifier l'état du cluster
+- name: Vérifier l'état du cluster
+  hosts: master
+  become: yes
+  vars:
+    normal_user: "{{ ansible_user_id }}"
+  
+  tasks:
+    # Assurer que l'utilisateur peut exécuter kubectl sans sudo
+    - name: Afficher l'état du cluster (comme utilisateur normal)
+      shell: kubectl get nodes
+      become: yes
+      become_user: "{{ normal_user }}"
+      environment:
+        KUBECONFIG: "/home/{{ normal_user }}/.kube/config"
+      register: nodes_status
+      ignore_errors: yes
+      
+    - name: Afficher le résultat de kubectl sans sudo
+      debug:
+        var: nodes_status.stdout_lines
+      when: nodes_status.stdout is defined
+      
+    - name: Afficher l'état des pods du système (comme utilisateur normal)
+      shell: kubectl get pods -A
+      become: yes
+      become_user: "{{ normal_user }}"
+      environment:
+        KUBECONFIG: "/home/{{ normal_user }}/.kube/config"
+      register: pods_status
+      ignore_errors: yes
+      
+    - name: Afficher le résultat des pods sans sudo
+      debug:
+        var: pods_status.stdout_lines
+      when: pods_status.stdout is defined
+      
+    # Instructions finales
+    - name: Instructions pour utiliser kubectl sans sudo
+      debug:
+        msg: |
+          Pour utiliser kubectl sans sudo, assurez-vous de recharger votre profil en exécutant:
+          source ~/.bashrc
+          
+          Ou déconnectez-vous et reconnectez-vous à votre session.
