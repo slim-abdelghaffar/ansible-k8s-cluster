@@ -1,32 +1,32 @@
 ---
-- name: Installation et configuration de Docker sur Ubuntu 22.04
+- name: Install and configure Docker on Ubuntu 22.04
   hosts: all
   become: yes
   tasks:
-    - name: Mise à jour des paquets
+    - name: Update packages
       apt:
         update_cache: yes
 
-    - name: Installation de Docker (avec -y pour éviter la confirmation)
+    - name: Install Docker (with -y to avoid confirmation)
       command: sudo apt install docker.io -y
       changed_when: true
 
-    - name: Activer Docker au démarrage
+    - name: Enable Docker to start on boot
       systemd:
         name: docker
         enabled: yes
 
-    - name: Démarrer Docker
+    - name: Start Docker
       systemd:
         name: docker
         state: started
 
-    - name: Vérifier le statut de Docker
+    - name: Check Docker status
       command: sudo systemctl status docker
       register: docker_status
       changed_when: false
 
-    - name: Afficher le statut du service Docker
+    - name: Display Docker service status
       debug:
         msg: "{{ docker_status.stdout_lines }}"
 

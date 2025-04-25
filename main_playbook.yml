@@ -1,0 +1,9 @@
+---
+- name: Execute all playbooks for Kubernetes setup
+  hosts: all
+  become: yes
+
+- import_playbook: k8s-prereq-docker.yml
+- import_playbook: k8s-core-install.yml
+- import_playbook: k8s-cluster-init.yml
+
