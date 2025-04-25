@@ -77,8 +77,8 @@
         path: /etc/hosts
         marker: "# {mark} ANSIBLE MANAGED BLOCK KUBERNETES"
         block: |
-          192.168.1.32 master-node
-          192.168.1.14 worker-node
+          @IP_MASTER master-node
+          @IP_WORKER worker-node
         create: yes
 
     # DNS configuration
